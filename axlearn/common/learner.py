@@ -9,7 +9,7 @@
 
 import dataclasses
 import enum
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
 
 import jax
 import optax
@@ -23,15 +23,17 @@ from axlearn.common.config import (
     config_class,
     config_for_function,
 )
-from axlearn.common.module import Module
+from axlearn.common.module import Module, OutputCollection
 from axlearn.common.optimizer_base import NestedOptParam, PartitionedGradientTransformation
 from axlearn.common.optimizers import param_ema
 from axlearn.common.utils import (
+    Nested,
     NestedPartitionSpec,
     NestedTensor,
     Tensor,
     flatten_items,
     match_regex_rules,
+    prune_tree,
     register_per_param_settings,
     tree_paths,
 )
@@ -70,6 +72,59 @@ def should_update_with_optimizers(update_type: UpdateType) -> bool:
 
 def should_apply_state_updates(update_type: UpdateType) -> bool:
     return update_type in (UpdateType.STATE_UPDATES, UpdateType.ALL_UPDATES)
+
+
+def _prune_empty(in_tree: NestedTensor) -> NestedTensor:
+    """Returns a shallow copy of the input tree with empty subtrees pruned.
+
+    If a tree would be made empty by removal of its subtrees, it will also be pruned.
+    This is a shallow copy because leaf nodes (non-dict values) are not deep-copied.
+
+    Args:
+        in_tree: the input tree to be pruned.
+
+    Returns:
+        The pruned copy of the input tree.
+    """
+    # Note that falsey values or empty Tensors are not considered empty.
+    return prune_tree(in_tree, lambda _, v: isinstance(v, dict) and not v)
+
+
+ForwardOutputs = Tuple[Tensor, Nested[Tensor], OutputCollection]
+
+
+@dataclasses.dataclass
+class ForwardOutputs:
+    loss: Tensor
+    aux: NestedTensor
+    output_collection: OutputCollection
+
+
+@dataclasses.dataclass
+class BackwardOutputs:
+    updated_params: NestedTensor
+
+
+@dataclasses.dataclass
+class ForwardBackwardOutputs:
+    forward_outputs: ForwardOutputs
+    backward_outputs: BackwardOutputs
+
+
+class ForwardFn(Protocol):
+    """Represents the model forward function."""
+
+    def __call__(self, inputs: NestedTensor, model_params: NestedTensor) -> ForwardOutputs:
+        """The forward function of a module.
+
+        Args:
+            inputs: The inputs for the forward function.
+            model_params: The model params.
+
+        Returns:
+            A ForwardOutputs value.
+        """
+        raise NotImplementedError(self)
 
 
 class BaseLearner(Module):
@@ -233,6 +288,22 @@ class Learner(BaseLearner):
             params=optimizer_model_params,
         )
         self.add_state_update("optimizer", optimizer_state)
+        return self._compute_updated_params(
+            model_params,
+            gradients=gradients,
+            optimizer_parameter_updates=optimizer_parameter_updates,
+            state_updates=state_updates,
+        )
+
+    def _compute_updated_params(
+        self,
+        model_params: NestedOptParam,
+        *,
+        gradients: NestedTensor,
+        optimizer_parameter_updates: NestedTensor,
+        state_updates: NestedTensor,
+    ) -> NestedTensor:
+        cfg = self.config
         if cfg.enable_per_variable_summaries:
             param_rms = jax.tree_util.tree_map(
                 lambda p: optax.safe_root_mean_squares(p.value, min_rms=1e-3), model_params
@@ -283,6 +354,60 @@ class Learner(BaseLearner):
             )
             self.add_state_update("ema", ema_state)
         return updated_model_params
+
+    def forward_and_backward(
+        self, *, fn: ForwardFn, inputs: NestedTensor, opt_params: NestedOptParam
+    ) -> ForwardBackwardOutputs:
+        model_params = jax.tree_util.tree_map(lambda opt_param: opt_param.value, opt_params)
+        should_compute_gradients = self.should_update_with_optimizers(model_params)
+        for path, value in flatten_items(should_compute_gradients):
+            if not value:
+                self.vlog(1, "Skipping gradients on %s", path)
+
+        def _forward(model_parameters_grad, model_parameters_no_grad, inputs):
+            model_params = jax.tree_util.tree_map(
+                lambda compute_grad, pg, png: pg if compute_grad else png,
+                should_compute_gradients,
+                model_parameters_grad,
+                model_parameters_no_grad,
+            )
+            forward_outputs: ForwardOutputs = fn(inputs=inputs, model_params=model_params)
+            return forward_outputs.loss, (forward_outputs.aux, forward_outputs.output_collection)
+
+        dummy_value = None
+        model_parameters_grad = jax.tree_util.tree_map(
+            lambda compute_gradients, v: v if compute_gradients else dummy_value,
+            should_compute_gradients,
+            model_params,
+        )
+        model_parameters_no_grad = jax.tree_util.tree_map(
+            lambda compute_gradients, v: dummy_value if compute_gradients else v,
+            should_compute_gradients,
+            model_params,
+        )
+        (loss, (aux, output_collection)), gradients = jax.value_and_grad(_forward, has_aux=True)(
+            model_parameters_grad,
+            model_parameters_no_grad,
+            inputs,
+        )
+        forward_outputs = ForwardOutputs(loss=loss, aux=aux, output_collection=output_collection)
+        optimizer_model_params = self._get_optimizer_model_params(opt_params)
+        optimizer_parameter_updates, optimizer_state = self.optimizer.update(
+            gradients,
+            state=self.state["optimizer"],
+            params=optimizer_model_params,
+        )
+        self.add_state_update("optimizer", optimizer_state)
+        updated_params = self._compute_updated_params(
+            opt_params,
+            gradients=gradients,
+            optimizer_parameter_updates=optimizer_parameter_updates,
+            state_updates=_prune_empty(forward_outputs.output_collection.state_updates),
+        )
+        return ForwardBackwardOutputs(
+            forward_outputs=forward_outputs,
+            backward_outputs=BackwardOutputs(updated_params=updated_params),
+        )
 
 
 def _apply_updates(base: NestedTensor, updates: NestedTensor) -> NestedTensor:
