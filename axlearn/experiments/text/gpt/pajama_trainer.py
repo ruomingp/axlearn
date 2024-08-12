@@ -81,7 +81,7 @@ def _eval_input_sources(
     }
 
 
-_SHUFFLE_BUFFER_SIZE = 8192
+_SHUFFLE_BUFFER_SIZE = 64
 
 
 DATASETS = {
